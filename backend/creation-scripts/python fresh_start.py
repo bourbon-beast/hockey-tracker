@@ -29,13 +29,9 @@ REQUEST_TIMEOUT = 10  # seconds
 MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds
 
-# Initialize Firebase
-cred = credentials.Certificate("../secrets/serviceAccountKey.json")
-firebase_admin.initialize_app(cred)
-db = firestore.client()
-
-# Regex for fixture links: /games/{comp_id}/{fixture_id}
+# Regex patterns
 COMP_FIXTURE_REGEX = re.compile(r"/games/(\d+)/(\d+)")
+TEAM_ID_REGEX = re.compile(r"/games/team/(\d+)/(\d+)")
 
 # Gender/type classification based on naming
 GENDER_MAP = {
@@ -54,6 +50,11 @@ TYPE_KEYWORDS = {
     "outdoor": "Outdoor",
     "indoor": "Indoor"
 }
+
+# Initialize Firebase
+cred = credentials.Certificate("../secrets/serviceAccountKey.json")
+firebase_admin.initialize_app(cred)
+db = firestore.client()
 
 def make_request(url, retry_count=0):
     """
@@ -82,7 +83,7 @@ def make_request(url, retry_count=0):
 
 def extract_club_info(team_name):
     """
-    Extract club name from team name and create a club ID.
+    Extract club name from team name.
 
     Args:
         team_name (str): Team name (e.g. "Mentone - Men's Vic League 1")
@@ -96,8 +97,8 @@ def extract_club_info(team_name):
         # Handle case where there's no delimiter
         club_name = team_name.split()[0]
 
-    # Generate club_id - lowercase, underscores
-    club_id = f"club_{club_name.lower().replace(' ', '_').replace('-', '_')}"
+    # Generate simpler club_id
+    club_id = club_name.lower().replace(" ", "_").replace("-", "_")
 
     return club_name, club_id
 
@@ -107,7 +108,7 @@ def create_or_get_club(club_name, club_id):
 
     Args:
         club_name (str): Club name
-        club_id (str): Generated club ID
+        club_id (str): Club ID
 
     Returns:
         DocumentReference: Reference to the club document
@@ -263,8 +264,8 @@ def create_competition(comp):
     Returns:
         DocumentReference: Reference to the competition document
     """
-    comp_id = int(comp["comp_id"])
-    fixture_id = int(comp["fixture_id"])
+    comp_id = comp["comp_id"]
+    fixture_id = comp["fixture_id"]
     comp_name = comp.get("comp_heading", comp["name"])
 
     # Determine competition type
@@ -281,12 +282,11 @@ def create_competition(comp):
         if len(parts) > 1 and parts[1].strip().isdigit():
             season = parts[1].strip()
 
-    # Create the Firestore document
-    comp_ref = db.collection("competitions").document(f"comp_{comp_id}")
+    # Create the Firestore document - use actual comp_id as document ID
+    comp_ref = db.collection("competitions").document(comp_id)
 
     comp_data = {
-        "id": f"comp_{comp_id}",
-        "comp_id": comp_id,
+        "id": comp_id,
         "name": comp_name,
         "type": comp_type,
         "season": season,
@@ -302,9 +302,72 @@ def create_competition(comp):
 
     return comp_ref
 
+def extract_team_ids_from_page(soup, comp_id):
+    """
+    Extract team IDs from a competition page.
+
+    Args:
+        soup (BeautifulSoup): Parsed HTML
+        comp_id (str): Competition ID
+
+    Returns:
+        dict: Dictionary mapping team names to their IDs
+    """
+    team_info = {}
+
+    # Look for team links in the page
+    for a in soup.find_all("a"):
+        href = a.get("href", "")
+        text = a.text.strip()
+
+        # Check if this is a team link
+        team_match = TEAM_ID_REGEX.search(href)
+        if team_match and is_valid_team(text):
+            link_comp_id, team_id = team_match.groups()
+
+            # Only use if the competition ID matches
+            if link_comp_id == comp_id:
+                team_info[text] = team_id
+                logger.debug(f"Found team ID for {text}: {team_id}")
+
+    return team_info
+
+def find_team_id_on_fixture_page(comp_id, fixture_id, team_name):
+    """
+    Find a team's ID by looking at the fixture page.
+
+    Args:
+        comp_id (str): Competition ID
+        fixture_id (str): Fixture/Grade ID
+        team_name (str): Team name to find
+
+    Returns:
+        str or None: Team ID if found
+    """
+    url = f"https://www.hockeyvictoria.org.au/games/{comp_id}/{fixture_id}/round/1"
+    response = make_request(url)
+
+    if not response:
+        return None
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    team_info = extract_team_ids_from_page(soup, comp_id)
+
+    # Look for exact match
+    if team_name in team_info:
+        return team_info[team_name]
+
+    # Try partial match if exact match not found
+    for name, team_id in team_info.items():
+        if team_name.lower() in name.lower() or name.lower() in team_name.lower():
+            logger.warning(f"Using partial match for {team_name}: found {name} with ID {team_id}")
+            return team_id
+
+    return None
+
 def find_and_create_teams(competitions):
     """
-    Scan competitions to find Mentone teams and create in Firestore.
+    Scan competitions to find team IDs and create in Firestore.
 
     Args:
         competitions (list): List of competition dictionaries
@@ -317,18 +380,43 @@ def find_and_create_teams(competitions):
     seen = set()
     processed_count = 0
 
-    # First, create all competitions
+    # Create all competitions first
     comp_refs = {}
     for comp in competitions:
         comp_ref = create_competition(comp)
-        comp_refs[int(comp["comp_id"])] = comp_ref
+        comp_refs[comp["comp_id"]] = comp_ref
 
+    # Create all grades (fixtures)
+    for comp in competitions:
+        # Use actual fixture_id as the document ID
+        fixture_id = comp["fixture_id"]
+        fixture_ref = db.collection("grades").document(fixture_id)
+
+        comp_id = comp["comp_id"]
+        comp_name = comp["name"]
+        team_type, gender = classify_team(comp_name)
+
+        fixture_data = {
+            "id": fixture_id,
+            "name": comp_name,
+            "comp_id": comp_id,
+            "type": team_type,
+            "gender": gender,
+            "competition_ref": comp_refs[comp_id],
+            "created_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": firestore.SERVER_TIMESTAMP
+        }
+
+        fixture_ref.set(fixture_data)
+        logger.info(f"Created grade: {comp_name} ({fixture_id})")
+
+    # Now process teams
     for comp in competitions:
         processed_count += 1
         comp_name = comp['name']
-        comp_id = int(comp['comp_id'])
-        fixture_id = int(comp['fixture_id'])
-        round_url = f"https://www.hockeyvictoria.org.au/games/{comp['comp_id']}/{comp['fixture_id']}/round/1"
+        comp_id = comp['comp_id']
+        fixture_id = comp['fixture_id']
+        round_url = f"https://www.hockeyvictoria.org.au/games/{comp_id}/{fixture_id}/round/1"
 
         logger.info(f"[{processed_count}/{len(competitions)}] Checking {comp_name} at {round_url}")
 
@@ -337,34 +425,48 @@ def find_and_create_teams(competitions):
             continue
 
         soup = BeautifulSoup(response.text, "html.parser")
-        found_mentone_team = False
 
-        # Extract all teams from this fixture to build club database
-        all_teams = set()
-        for a in soup.find_all("a"):
-            text = a.text.strip()
-            if "hockey club" in text.lower() and all(kw not in text.lower() for kw in ["playing fields", "grammar"]):
-                all_teams.add(text)
+        # Extract teams and their IDs from the page
+        team_info = extract_team_ids_from_page(soup, comp_id)
 
-        # Create clubs and teams for all found teams
+        # Also look for team names in the fixtures that might not have direct links
+        fixture_teams = set()
+        for div in soup.select(".fixture-details-team-name"):
+            text = div.text.strip()
+            if is_valid_team(text):
+                fixture_teams.add(text)
+
+        # Combine both sources
+        all_teams = set(team_info.keys()) | fixture_teams
+
+        team_type, gender = classify_team(comp_name)
+
+        # Create/update teams
         for team_name in all_teams:
+            # Extract club information
             club_name, club_id = extract_club_info(team_name)
 
-            # Skip if we've already seen this team/fixture combo
+            # Skip if we've already seen this team
             key = (team_name, fixture_id)
             if key in seen:
                 continue
 
             seen.add(key)
 
-            # Create or get club
+            # Get team ID - either from our extraction or try to find it
+            team_id = team_info.get(team_name)
+
+            if not team_id:
+                # Try to find the team ID using other methods
+                team_id = find_team_id_on_fixture_page(comp_id, fixture_id, team_name)
+
+            if not team_id:
+                # If still not found, create a fallback ID
+                logger.warning(f"Could not find actual team ID for {team_name}, using fallback ID")
+                team_id = f"{fixture_id}_{club_id}"
+
+            # Create or get club reference
             club_ref = create_or_get_club(club_name, club_id)
-
-            # Determine team type and gender
-            team_type, gender = classify_team(comp_name)
-
-            # Create team ID
-            team_id = f"team_{fixture_id}_{club_id}"
 
             # Create team data
             team_data = {
@@ -392,90 +494,78 @@ def find_and_create_teams(competitions):
 
             # Log Mentone teams specifically
             if TEAM_FILTER.lower() in team_name.lower():
-                found_mentone_team = True
-                logger.info(f"Found Mentone team: {team_name} ({team_type}, {gender})")
+                logger.info(f"Found Mentone team: {team_name} (ID: {team_id}, Type: {team_type}, Gender: {gender})")
             else:
-                logger.debug(f"Found team: {team_name} ({team_type}, {gender})")
-
-        if not found_mentone_team:
-            logger.debug(f"No Mentone teams found in {comp_name}")
+                logger.debug(f"Found team: {team_name} (ID: {team_id})")
 
     logger.info(f"Team discovery complete. Found {len(teams)} teams total.")
     return teams
 
 def generate_sample_players(teams):
     """
-    Generate sample players for each team.
+    Generate sample players for each team (just one per team).
 
     Args:
         teams (list): List of team data
     """
-    logger.info(f"Creating sample players for {len(teams)} teams")
+    logger.info(f"Creating one sample player for each Mentone team")
 
     # Sample player names
-    mens_names = ["James Smith", "Michael Brown", "Robert Jones", "David Miller",
-                  "John Wilson", "Thomas Moore", "Daniel Taylor", "Paul Anderson",
-                  "Andrew Thomas", "Joshua White", "William Harris", "Christopher Jackson",
-                  "Matthew Clark", "Richard Lewis", "Charles Walker", "Joseph Young"]
+    mens_names = ["James Smith", "Michael Brown", "Robert Jones", "David Miller"]
+    womens_names = ["Jennifer Smith", "Lisa Brown", "Mary Jones", "Sarah Miller"]
 
-    womens_names = ["Jennifer Smith", "Lisa Brown", "Mary Jones", "Sarah Miller",
-                    "Jessica Wilson", "Emily Moore", "Emma Taylor", "Olivia Anderson",
-                    "Isabella Thomas", "Sophia White", "Charlotte Harris", "Amelia Jackson",
-                    "Ava Clark", "Mia Lewis", "Elizabeth Walker", "Abigail Young"]
-
-    # Create 5-10 players per team
+    # Create 1 player per team
+    players_created = 0
     for team in teams:
-        # Skip non-Mentone teams to avoid creating too many players
+        # Skip non-Mentone teams
         if team.get("is_home_club", False) == False:
             continue
 
-        # Use appropriate names based on gender
+        # Use appropriate name based on gender
         if team["gender"] == "Men":
-            names = mens_names
+            name = mens_names[0]
         else:
-            names = womens_names
+            name = womens_names[0]
 
-        # Determine number of players (5-10)
-        num_players = min(len(names), 10)
+        # Create simple player ID
+        player_id = f"{team['id']}_player1"
 
-        for i in range(num_players):
-            player_id = f"player_{team['id']}_{i+1}"
-
-            # Create player data
-            player_data = {
-                "id": player_id,
-                "name": names[i],
-                "teams": [team["id"]],
-                "team_refs": [db.collection("teams").document(team["id"])],
-                "gender": team["gender"],
-                "club_id": team["club_id"],
-                "club_ref": db.collection("clubs").document(team["club_id"]),
-                "primary_team_id": team["id"],
-                "primary_team_ref": db.collection("teams").document(team["id"]),
-                "created_at": firestore.SERVER_TIMESTAMP,
-                "updated_at": firestore.SERVER_TIMESTAMP,
-                "stats": {
-                    "goals": i,
-                    "assists": i * 2,
-                    "games_played": 5,
-                    "yellow_cards": 0 if i < 8 else 1,
-                    "red_cards": 0,
-                }
+        # Create player data
+        player_data = {
+            "id": player_id,
+            "name": name,
+            "teams": [team["id"]],
+            "team_refs": [db.collection("teams").document(team["id"])],
+            "gender": team["gender"],
+            "club_id": team["club_id"],
+            "club_ref": db.collection("clubs").document(team["club_id"]),
+            "primary_team_id": team["id"],
+            "primary_team_ref": db.collection("teams").document(team["id"]),
+            "created_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+            "stats": {
+                "goals": 2,
+                "assists": 3,
+                "games_played": 5,
+                "yellow_cards": 0,
+                "red_cards": 0,
             }
+        }
 
-            # Save to Firestore
-            db.collection("players").document(player_id).set(player_data)
+        # Save to Firestore
+        db.collection("players").document(player_id).set(player_data)
+        players_created += 1
 
-        logger.info(f"Created {num_players} players for team {team['name']}")
+    logger.info(f"Created {players_created} sample players")
 
 def generate_sample_games(teams):
     """
-    Generate sample games for teams.
+    Generate sample games for teams (just one per team).
 
     Args:
         teams (list): List of team data
     """
-    logger.info(f"Creating sample games for teams")
+    logger.info(f"Creating one sample game for each Mentone team")
 
     # Get Mentone teams
     mentone_teams = [team for team in teams if team.get("is_home_club", False)]
@@ -491,19 +581,18 @@ def generate_sample_games(teams):
         logger.warning("No opponent teams found, using Mentone teams as opponents")
         opponent_teams = mentone_teams
 
-    # Generate 5 rounds of fixtures
-    venues = ["Mentone Grammar Playing Fields", "State Netball Hockey Centre",
-              "Hawthorn Hockey Club", "Footscray Hockey Club", "Doncaster Hockey Club"]
+    # Set of sample venues
+    venues = ["Mentone Grammar Playing Fields", "State Netball Hockey Centre"]
 
     games_created = 0
 
     for mentone_team in mentone_teams:
-        # Find appropriate opponents (same gender, same competition level if possible)
+        # Find appropriate opponents (same gender, same competition level)
         suitable_opponents = [team for team in opponent_teams
                               if team["gender"] == mentone_team["gender"]
                               and team["comp_id"] == mentone_team["comp_id"]]
 
-        # If no suitable opponents, use any opponent of the same gender
+        # If no suitable opponents, use any opponent of same gender
         if not suitable_opponents:
             suitable_opponents = [team for team in opponent_teams if team["gender"] == mentone_team["gender"]]
 
@@ -511,113 +600,54 @@ def generate_sample_games(teams):
         if not suitable_opponents:
             suitable_opponents = opponent_teams
 
-        # Create 5 home games and 5 away games
-        for round_num in range(1, 6):
-            # Home game
-            if suitable_opponents:
-                opponent = suitable_opponents[round_num % len(suitable_opponents)]
+        # If we have an opponent, create one sample game
+        if suitable_opponents:
+            opponent = suitable_opponents[0]
 
-                game_id = f"game_{mentone_team['id']}_{opponent['id']}_{round_num}_home"
+            # Use a simple game ID combining grade and team IDs
+            game_id = f"{mentone_team['fixture_id']}_{mentone_team['id']}_{opponent['id']}"
 
-                # Game date (Saturday of each week starting April 2025)
-                game_date = datetime(2025, 4, 5) + timedelta(days=(round_num-1)*7)
+            # Sample date - a Saturday in the future
+            game_date = datetime(2025, 4, 5)
 
-                # Random scores for completed games (first 3 rounds)
-                status = "completed" if round_num <= 3 else "scheduled"
-                home_score = round_num * 2 if status == "completed" else None
-                away_score = round_num if status == "completed" else None
+            # Create sample game
+            game_data = {
+                "id": game_id,
+                "fixture_id": mentone_team["fixture_id"],
+                "comp_id": mentone_team["comp_id"],
+                "round": 1,
+                "date": game_date,
+                "venue": venues[0],
+                "status": "scheduled",
+                "home_team": {
+                    "id": mentone_team["id"],
+                    "name": mentone_team["name"],
+                    "club": mentone_team["club"],
+                    "club_id": mentone_team["club_id"]
+                },
+                "away_team": {
+                    "id": opponent["id"],
+                    "name": opponent["name"],
+                    "club": opponent["club"],
+                    "club_id": opponent["club_id"]
+                },
+                "team_refs": [
+                    db.collection("teams").document(mentone_team["id"]),
+                    db.collection("teams").document(opponent["id"])
+                ],
+                "club_refs": [
+                    db.collection("clubs").document(mentone_team["club_id"]),
+                    db.collection("clubs").document(opponent["club_id"])
+                ],
+                "competition_ref": db.collection("competitions").document(mentone_team["comp_id"]),
+                "grade_ref": db.collection("grades").document(mentone_team["fixture_id"]),
+                "created_at": firestore.SERVER_TIMESTAMP,
+                "updated_at": firestore.SERVER_TIMESTAMP
+            }
 
-                game_data = {
-                    "id": game_id,
-                    "fixture_id": mentone_team["fixture_id"],
-                    "comp_id": mentone_team["comp_id"],
-                    "round": round_num,
-                    "date": game_date,
-                    "venue": venues[round_num % len(venues)],
-                    "status": status,
-                    "home_team": {
-                        "id": mentone_team["id"],
-                        "name": mentone_team["name"],
-                        "club": mentone_team["club"],
-                        "club_id": mentone_team["club_id"],
-                        "score": home_score
-                    },
-                    "away_team": {
-                        "id": opponent["id"],
-                        "name": opponent["name"],
-                        "club": opponent["club"],
-                        "club_id": opponent["club_id"],
-                        "score": away_score
-                    },
-                    "team_refs": [
-                        db.collection("teams").document(mentone_team["id"]),
-                        db.collection("teams").document(opponent["id"])
-                    ],
-                    "club_refs": [
-                        db.collection("clubs").document(mentone_team["club_id"]),
-                        db.collection("clubs").document(opponent["club_id"])
-                    ],
-                    "competition_ref": db.collection("competitions").document(f"comp_{mentone_team['comp_id']}"),
-                    "created_at": firestore.SERVER_TIMESTAMP,
-                    "updated_at": firestore.SERVER_TIMESTAMP
-                }
-
-                # Save to Firestore
-                db.collection("games").document(game_id).set(game_data)
-                games_created += 1
-
-            # Away game (2 weeks after home game)
-            if suitable_opponents:
-                opponent = suitable_opponents[(round_num + 2) % len(suitable_opponents)]
-
-                game_id = f"game_{opponent['id']}_{mentone_team['id']}_{round_num}_away"
-
-                # Game date (Saturday of each week starting April 2025, 1 week after home)
-                game_date = datetime(2025, 4, 12) + timedelta(days=(round_num-1)*7)
-
-                # Random scores for completed games (first 3 rounds)
-                status = "completed" if round_num <= 3 else "scheduled"
-                home_score = round_num if status == "completed" else None
-                away_score = round_num * 2 if status == "completed" else None
-
-                game_data = {
-                    "id": game_id,
-                    "fixture_id": mentone_team["fixture_id"],
-                    "comp_id": mentone_team["comp_id"],
-                    "round": round_num + 5,  # Return fixtures are rounds 6-10
-                    "date": game_date,
-                    "venue": venues[(round_num + 2) % len(venues)],
-                    "status": status,
-                    "home_team": {
-                        "id": opponent["id"],
-                        "name": opponent["name"],
-                        "club": opponent["club"],
-                        "club_id": opponent["club_id"],
-                        "score": home_score
-                    },
-                    "away_team": {
-                        "id": mentone_team["id"],
-                        "name": mentone_team["name"],
-                        "club": mentone_team["club"],
-                        "club_id": mentone_team["club_id"],
-                        "score": away_score
-                    },
-                    "team_refs": [
-                        db.collection("teams").document(opponent["id"]),
-                        db.collection("teams").document(mentone_team["id"])
-                    ],
-                    "club_refs": [
-                        db.collection("clubs").document(opponent["club_id"]),
-                        db.collection("clubs").document(mentone_team["club_id"])
-                    ],
-                    "competition_ref": db.collection("competitions").document(f"comp_{mentone_team['comp_id']}"),
-                    "created_at": firestore.SERVER_TIMESTAMP,
-                    "updated_at": firestore.SERVER_TIMESTAMP
-                }
-
-                # Save to Firestore
-                db.collection("games").document(game_id).set(game_data)
-                games_created += 1
+            # Save to Firestore
+            db.collection("games").document(game_id).set(game_data)
+            games_created += 1
 
     logger.info(f"Created {games_created} sample games")
 
@@ -627,7 +657,7 @@ def cleanup_firestore():
     """
     logger.info("Cleaning up Firestore collections...")
 
-    collections_to_clean = ["clubs", "competitions", "teams", "games", "players", "settings"]
+    collections_to_clean = ["clubs", "competitions", "grades", "teams", "games", "players", "settings"]
 
     for collection_name in collections_to_clean:
         docs = db.collection(collection_name).stream()
@@ -705,10 +735,10 @@ def main():
         # Save teams to JSON
         save_teams_to_json(teams)
 
-        # Create sample players
+        # Create sample players - just one per team
         generate_sample_players(teams)
 
-        # Create sample games
+        # Create sample games - just one per team
         generate_sample_games(teams)
 
         # Create settings
