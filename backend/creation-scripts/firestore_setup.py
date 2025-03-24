@@ -35,43 +35,35 @@ def setup_collections():
     print("Firestore collections setup complete!")
 
 def setup_competitions_and_grades(teams_data):
-    """Create competitions and grades collections from team data"""
+    """Create competitions and grades collections from team data with improved key structure"""
     print("Setting up competitions and grades collections...")
 
-    # Extract unique competitions
+    # Extract unique competitions and grades
     competitions = {}
     grades = {}
 
     for team in teams_data:
         comp_id = team["comp_id"]
         fixture_id = team["fixture_id"]
+        team_type = team["type"]  # Now properly set by builder.py
 
         # Process competition if new
         if comp_id not in competitions:
-            # Determine competition type based on name
-            comp_type = "Senior"  # Default
-            if "junior" in team["comp_name"].lower():
-                comp_type = "Junior"
-            elif any(keyword in team["comp_name"].lower() for keyword in ["masters", "midweek", "35+", "60+"]):
-                comp_type = "Midweek/Masters"
-
             # Get season from comp name
             comp_parts = team["comp_name"].split(" - ")
             season = comp_parts[1] if len(comp_parts) > 1 else "2025"
 
+            # Create a unique competition ID that combines type and comp_id
+            composite_id = f"comp_{team_type.lower()}_{comp_id}"
+
             # Determine the competition name
-            if comp_type == "Senior":
-                competition_name = f"{season} Senior Competition"
-            elif comp_type == "Junior":
-                competition_name = f"{season} Junior Competition"
-            else:
-                competition_name = f"{season} Midweek/Masters Competition"
+            competition_name = f"{season} {team_type} Competition"
 
             competitions[comp_id] = {
-                "id": f"comp_{comp_id}",
-                "comp_id": comp_id,
+                "id": composite_id,
+                "comp_id": comp_id,  # Still keep the original ID for URL construction
                 "name": competition_name,
-                "type": comp_type,
+                "type": team_type,
                 "season": season,
                 "start_date": "2025-03-15",  # Placeholder
                 "end_date": "2025-09-20",    # Placeholder
@@ -84,50 +76,60 @@ def setup_competitions_and_grades(teams_data):
             comp_parts = team["comp_name"].split(" - ")
             grade_name = comp_parts[0]
 
+            # Create a unique grade ID that combines type and fixture_id
+            composite_grade_id = f"grade_{team_type.lower()}_{fixture_id}"
+
             grades[fixture_id] = {
-                "id": f"grade_{fixture_id}",
+                "id": composite_grade_id,
                 "fixture_id": fixture_id,
                 "comp_id": comp_id,
                 "name": grade_name,
                 "gender": team["gender"],
                 "competition": competitions[comp_id]["name"],
-                "competition_ref": db.collection("competitions").document(f"comp_{comp_id}")
+                "competition_ref": db.collection("competitions").document(competitions[comp_id]["id"])
             }
 
     # Add competitions to Firestore
     for comp_id, comp_data in competitions.items():
-        db.collection("competitions").document(f"comp_{comp_id}").set(comp_data)
-        print(f"Added competition: {comp_data['name']}")
+        db.collection("competitions").document(comp_data["id"]).set(comp_data)
+        print(f"Added competition: {comp_data['name']} with ID {comp_data['id']}")
 
     # Add grades to Firestore
     for fixture_id, grade_data in grades.items():
-        db.collection("grades").document(f"grade_{fixture_id}").set(grade_data)
+        db.collection("grades").document(grade_data["id"]).set(grade_data)
         print(f"Added grade: {grade_data['name']} in {grade_data['competition']}")
 
 def setup_teams(teams_data):
-    """Create teams collection from team data"""
+    """Create teams collection using the new composite IDs"""
     print("Setting up teams collection...")
 
     for team in teams_data:
-        team_id = f"team_{team['fixture_id']}"
         fixture_id = team["fixture_id"]
+        comp_id = team["comp_id"]
+        team_type = team["type"].lower()
+
+        # Create composite IDs for references
+        competition_id = f"comp_{team_type}_{comp_id}"
+        grade_id = f"grade_{team_type}_{fixture_id}"
+        team_id = f"team_{team_type}_{fixture_id}"
 
         team_data = {
             "id": team_id,
             "name": team["name"],
             "fixture_id": fixture_id,
-            "comp_id": team["comp_id"],
+            "comp_id": comp_id,
+            "type": team["type"],
             "gender": team["gender"],
             "club": team["club"],
-            "grade_ref": db.collection("grades").document(f"grade_{fixture_id}"),
-            "competition_ref": db.collection("competitions").document(f"comp_{team['comp_id']}")
+            "grade_ref": db.collection("grades").document(grade_id),
+            "competition_ref": db.collection("competitions").document(competition_id)
         }
 
         db.collection("teams").document(team_id).set(team_data)
-        print(f"Added team: {team['name']}")
+        print(f"Added team: {team['name']} with ID {team_id}")
 
 def setup_sample_games():
-    """Create sample games for demonstration"""
+    """Create sample games for demonstration with improved references"""
     print("Setting up sample games collection...")
 
     # Get all teams
@@ -141,12 +143,14 @@ def setup_sample_games():
     # Create 3 sample games for each team
     game_count = 0
     for team_id, team in teams.items():
-        grade_id = f"grade_{team['fixture_id']}"
-        grade = grades.get(grade_id, {})
+        team_type = team['type'].lower()
+        fixture_id = team['fixture_id']
+        grade_id = f"grade_{team_type}_{fixture_id}"
+        competition_id = f"comp_{team_type}_{team['comp_id']}"
 
         for round_num in range(1, 4):
-            # Create a game with this team as home team
-            game_id = f"game_{team['fixture_id']}_{round_num}"
+            # Create a unique game ID
+            game_id = f"game_{team_type}_{fixture_id}_{round_num}"
 
             # Generate a game date (Saturdays starting from April 5, 2025)
             game_date = datetime(2025, 4, 5) + timedelta(days=(round_num-1)*7)
@@ -178,7 +182,7 @@ def setup_sample_games():
                 "player_stats": {},
                 "team_ref": db.collection("teams").document(team_id),
                 "grade_ref": db.collection("grades").document(grade_id),
-                "competition_ref": db.collection("competitions").document(f"comp_{team['comp_id']}")
+                "competition_ref": db.collection("competitions").document(competition_id)
             }
 
             db.collection("games").document(game_id).set(game_data)
@@ -187,7 +191,7 @@ def setup_sample_games():
     print(f"Added {game_count} sample games")
 
 def setup_players():
-    """Create sample players collection"""
+    """Create sample players collection with improved references"""
     print("Setting up players collection...")
 
     # Get all teams
@@ -211,7 +215,9 @@ def setup_players():
     player_count = 0
     for team_id, team in teams.items():
         # Get grade info
-        grade_id = f"grade_{team['fixture_id']}"
+        team_type = team['type'].lower()
+        fixture_id = team['fixture_id']
+        grade_id = f"grade_{team_type}_{fixture_id}"
         grade = grades.get(grade_id, {})
 
         # Choose names based on gender
