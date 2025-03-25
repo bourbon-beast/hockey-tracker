@@ -32,6 +32,7 @@ RETRY_DELAY = 2  # seconds
 # Regex patterns
 COMP_FIXTURE_REGEX = re.compile(r"/games/(\d+)/(\d+)")
 TEAM_ID_REGEX = re.compile(r"/games/team/(\d+)/(\d+)")
+GAME_ID_REGEX = re.compile(r'/game/(\d+)$')
 
 # Gender/type classification based on naming
 GENDER_MAP = {
@@ -101,6 +102,23 @@ def extract_club_info(team_name):
     club_id = club_name.lower().replace(" ", "_").replace("-", "_")
 
     return club_name, club_id
+
+def create_team_name(comp_name, club="Mentone"):
+    """
+    Create a descriptive team name from competition name.
+
+    Args:
+        comp_name (str): Competition name
+        club (str): Club name prefix
+
+    Returns:
+        str: Formatted team name
+    """
+    # Strip year and clean up competition name
+    name = comp_name.split(' - ')[0] if ' - ' in comp_name else comp_name
+
+    # Create a descriptive team name
+    return f"{club} - {name}"
 
 def create_or_get_club(club_name, club_id):
     """
@@ -194,21 +212,6 @@ def is_valid_team(name):
     """
     invalid_keywords = ["playing fields", "grammar"]
     return all(kw not in name.lower() for kw in invalid_keywords) and "hockey club" in name.lower()
-
-def create_team_name(comp_name, club="Mentone"):
-    """
-    Create a team name from competition name.
-
-    Args:
-        comp_name (str): Competition name
-        club (str): Club name prefix
-
-    Returns:
-        str: Formatted team name
-    """
-    # Strip year and clean up
-    name = comp_name.split(' - ')[0] if ' - ' in comp_name else comp_name
-    return f"{club} - {name}"
 
 def get_competition_blocks():
     """
@@ -442,9 +445,15 @@ def find_and_create_teams(competitions):
         team_type, gender = classify_team(comp_name)
 
         # Create/update teams
-        for team_name in all_teams:
+        for raw_team_name in all_teams:
             # Extract club information
-            club_name, club_id = extract_club_info(team_name)
+            club_name, club_id = extract_club_info(raw_team_name)
+
+            # Create a proper descriptive team name using the competition name
+            # This ensures teams are named like "Mentone - Women's Premier League"
+            # instead of just "Mentone Hockey Club"
+            competition_part = comp_name.split(' - ')[0] if ' - ' in comp_name else comp_name
+            team_name = f"{club_name} - {competition_part}"
 
             # Skip if we've already seen this team
             key = (team_name, fixture_id)
@@ -454,11 +463,11 @@ def find_and_create_teams(competitions):
             seen.add(key)
 
             # Get team ID - either from our extraction or try to find it
-            team_id = team_info.get(team_name)
+            team_id = team_info.get(raw_team_name)
 
             if not team_id:
                 # Try to find the team ID using other methods
-                team_id = find_team_id_on_fixture_page(comp_id, fixture_id, team_name)
+                team_id = find_team_id_on_fixture_page(comp_id, fixture_id, raw_team_name)
 
             if not team_id:
                 # If still not found, create a fallback ID
@@ -471,7 +480,7 @@ def find_and_create_teams(competitions):
             # Create team data
             team_data = {
                 "id": team_id,
-                "name": team_name,
+                "name": team_name,  # Use our formatted team name with competition
                 "fixture_id": fixture_id,
                 "comp_id": comp_id,
                 "comp_name": comp_name,
@@ -604,15 +613,21 @@ def generate_sample_games(teams):
         if suitable_opponents:
             opponent = suitable_opponents[0]
 
-            # Use a simple game ID combining grade and team IDs
-            game_id = f"{mentone_team['fixture_id']}_{mentone_team['id']}_{opponent['id']}"
+            # Create a proper game ID using the pattern "1_fixture_id" + timestamp
+            # Actual hockey victoria IDs are numerical, so we'll simulate that format
+            timestamp = int(time.time()) % 10000  # Last 4 digits of current timestamp
+            game_id = f"1{mentone_team['fixture_id']}{timestamp}"
 
             # Sample date - a Saturday in the future
             game_date = datetime(2025, 4, 5)
 
+            # Create the game URL as would be found on Hockey Victoria
+            game_url = f"https://www.hockeyvictoria.org.au/game/{game_id}"
+
             # Create sample game
             game_data = {
                 "id": game_id,
+                "url": game_url,
                 "fixture_id": mentone_team["fixture_id"],
                 "comp_id": mentone_team["comp_id"],
                 "round": 1,
@@ -650,6 +665,141 @@ def generate_sample_games(teams):
             games_created += 1
 
     logger.info(f"Created {games_created} sample games")
+
+def process_round_page(comp_id, fixture_id, round_num, team_id, team_name):
+    """Process a single round page and extract games for a team"""
+    round_url = f"https://www.hockeyvictoria.org.au/games/{comp_id}/{fixture_id}/round/{round_num}"
+    logger.info(f"Checking round URL: {round_url}")
+
+    response = make_request(round_url)
+    if not response:
+        logger.warning(f"Failed to fetch round {round_num}: Status code error")
+        return None
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    game_elements = soup.select("div.card-body.font-size-sm")
+    logger.info(f"Found {len(game_elements)} games on round {round_num} page")
+
+    for game_el in game_elements:
+        team_links = game_el.select("div.col-lg-3 a")
+        if len(team_links) != 2:
+            continue
+
+        hrefs = [a.get("href", "") for a in team_links]
+        team_match = any(f"/games/team/{comp_id}/{team_id.split('_')[-1]}" in href for href in hrefs)
+        if not team_match:
+            continue
+
+        try:
+            game = {}
+
+            # Extract date and time
+            datetime_el = game_el.select_one("div.col-md")
+            if datetime_el:
+                lines = datetime_el.get_text("\n", strip=True).split("\n")
+                date_str = lines[0]
+                time_str = lines[1] if len(lines) > 1 else "12:00"
+                try:
+                    game_date = datetime.strptime(f"{date_str} {time_str}", "%a %d %b %Y %H:%M")
+                except:
+                    game_date = datetime.strptime(f"{date_str} {time_str}", "%a %d %b %Y %I:%M %p")
+                game["date"] = game_date
+
+            # Venue
+            venue_link = game_el.select_one("div.col-md a")
+            game["venue"] = venue_link.text.strip() if venue_link else None
+
+            # Teams
+            game["home_team"] = {
+                "name": team_links[0].text.strip(),
+                "id": None,
+                "club": None
+            }
+            game["away_team"] = {
+                "name": team_links[1].text.strip(),
+                "id": None,
+                "club": None
+            }
+
+            # Determine if our team is home or away
+            if f"/games/team/{comp_id}/{team_id.split('_')[-1]}" in hrefs[0]:
+                game["home_team"]["id"] = team_id
+                game["home_team"]["club"] = "Mentone"
+            else:
+                game["away_team"]["id"] = team_id
+                game["away_team"]["club"] = "Mentone"
+
+            # Game status
+            now = datetime.now()
+            if game["date"] < now:
+                game["status"] = "in_progress"
+            else:
+                game["status"] = "scheduled"
+
+            # Metadata
+            game["round"] = round_num
+            game["comp_id"] = comp_id
+            game["fixture_id"] = fixture_id
+            game["team_ref"] = db.collection("teams").document(team_id)
+            game["competition_ref"] = db.collection("competitions").document(comp_id)
+            game["grade_ref"] = db.collection("grades").document(fixture_id)
+            game["player_stats"] = {}
+
+            # Details URL and extract game ID
+            details_btn = game_el.select_one("a.btn-outline-primary")
+            if details_btn and "href" in details_btn.attrs:
+                game_url = details_btn["href"]
+                game["url"] = game_url
+
+                # Extract the actual game ID from the URL
+                # URLs typically look like: https://www.hockeyvictoria.org.au/game/2048530
+                game_id_match = GAME_ID_REGEX.search(game_url)
+                if game_id_match:
+                    game_id = game_id_match.group(1)
+                    game["id"] = game_id
+                else:
+                    # Fallback if we can't extract the ID from URL
+                    game_id = f"game_{team_id}_{round_num}_{int(time.time())}"
+                    game["id"] = game_id
+            else:
+                # Fallback if there's no details button
+                game_id = f"game_{team_id}_{round_num}_{int(time.time())}"
+                game["id"] = game_id
+
+            return game
+
+        except Exception as e:
+            logger.error(f"Error parsing game: {e}")
+            continue
+
+    return None
+
+def fetch_team_games(team_data, max_rounds=10):
+    """
+    Fetch games for a specific team.
+
+    Args:
+        team_data (dict): Team data
+        max_rounds (int): Maximum number of rounds to check
+
+    Returns:
+        list: Found games
+    """
+    team_id = team_data['id']
+    comp_id = team_data['comp_id']
+    fixture_id = team_data['fixture_id']
+    team_name = team_data['name']
+
+    logger.info(f"Fetching games for team: {team_name}")
+    games = []
+    for round_num in range(1, max_rounds + 1):
+        game = process_round_page(comp_id, fixture_id, round_num, team_id, team_name)
+        if game:
+            games.append(game)
+        time.sleep(0.5)  # Be nice to the server
+
+    logger.info(f"Found {len(games)} games for {team_name}")
+    return games
 
 def cleanup_firestore():
     """
@@ -743,6 +893,19 @@ def main():
 
         # Create settings
         create_settings()
+
+        # Try to fetch some real games for Mentone teams
+        mentone_teams = [team for team in teams if team.get("is_home_club", False)]
+        if mentone_teams:
+            logger.info(f"Attempting to fetch real games for {len(mentone_teams)} Mentone teams")
+            games_found = 0
+            # Just try one team to see if it works
+            for team in mentone_teams[:2]:  # Limit to first 2 teams to avoid overloading
+                team_games = fetch_team_games(team, max_rounds=3)  # Only check first 3 rounds
+                for game in team_games:
+                    db.collection("games").document(game["id"]).set(game)
+                    games_found += 1
+            logger.info(f"Successfully found and added {games_found} real games from Hockey Victoria")
 
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
