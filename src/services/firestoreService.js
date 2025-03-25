@@ -16,6 +16,127 @@ import { db } from '../../firebase';
 
 // ===== CLUB METHODS =====
 
+// src/services/firestoreService.js
+// Add these functions to your existing firestoreService.js file
+
+import {
+    collection,
+    query,
+    where,
+    getDocs,
+    orderBy,
+    Timestamp
+} from 'firebase/firestore';
+import { db } from '../../firebase';
+
+/**
+ * Fetch games for a specific date range
+ * @param {Date} startDate - Start date for range
+ * @param {Date} endDate - End date for range
+ * @param {String} clubId - Optional club ID to filter games
+ * @returns {Promise<Array>} Array of game objects
+ */
+export const fetchGamesByDateRange = async (startDate, endDate, clubId = null) => {
+    try {
+        // Create Firestore timestamp objects for our date range
+        const startTimestamp = Timestamp.fromDate(startDate);
+        const endTimestamp = Timestamp.fromDate(endDate);
+
+        // Start building the query
+        const gamesRef = collection(db, 'games');
+        let gameQuery = query(
+            gamesRef,
+            where('date', '>=', startTimestamp),
+            where('date', '<=', endTimestamp),
+            orderBy('date', 'asc')
+        );
+
+        // If a club ID is provided, filter for games involving that club
+        // Note: This would require a separate query if using Firestore
+        // since we can't do OR conditions with different fields
+
+        const querySnapshot = await getDocs(gameQuery);
+
+        const games = [];
+        querySnapshot.forEach((doc) => {
+            const data = doc.data();
+
+            // Convert Firestore timestamp to JS Date
+            const gameDate = data.date instanceof Timestamp ?
+                data.date.toDate() :
+                (data.date ? new Date(data.date) : new Date());
+
+            // If club ID is provided, filter results client-side
+            if (clubId) {
+                const homeClubId = data.home_team?.club_id;
+                const awayClubId = data.away_team?.club_id;
+
+                if (homeClubId !== clubId && awayClubId !== clubId) {
+                    return; // Skip this game
+                }
+            }
+
+            games.push({
+                id: doc.id,
+                ...data,
+                date: gameDate
+            });
+        });
+
+        return games;
+    } catch (error) {
+        console.error('Error fetching games by date range:', error);
+        throw error;
+    }
+};
+
+/**
+ * Group games by category (Men's, Women's, Juniors, Midweek)
+ * @param {Array} games - Array of game objects
+ * @returns {Object} Object with games grouped by category
+ */
+export const groupGamesByCategory = (games) => {
+    return {
+        "Men's": games.filter(game => {
+            const homeTeamName = (game.home_team?.name || '').toLowerCase();
+            const awayTeamName = (game.away_team?.name || '').toLowerCase();
+            return homeTeamName.includes("men's") || awayTeamName.includes("men's");
+        }),
+
+        "Women's": games.filter(game => {
+            const homeTeamName = (game.home_team?.name || '').toLowerCase();
+            const awayTeamName = (game.away_team?.name || '').toLowerCase();
+            return homeTeamName.includes("women's") || awayTeamName.includes("women's");
+        }),
+
+        "Juniors": games.filter(game => {
+            const homeTeamName = (game.home_team?.name || '').toLowerCase();
+            const awayTeamName = (game.away_team?.name || '').toLowerCase();
+            return homeTeamName.includes("under") ||
+                awayTeamName.includes("under") ||
+                homeTeamName.includes("u12") ||
+                awayTeamName.includes("u12") ||
+                homeTeamName.includes("u14") ||
+                awayTeamName.includes("u14") ||
+                homeTeamName.includes("u16") ||
+                awayTeamName.includes("u16") ||
+                homeTeamName.includes("u18") ||
+                awayTeamName.includes("u18");
+        }),
+
+        "Midweek": games.filter(game => {
+            const homeTeamName = (game.home_team?.name || '').toLowerCase();
+            const awayTeamName = (game.away_team?.name || '').toLowerCase();
+            const isWeekend = game.date ? (game.date.getDay() === 0 || game.date.getDay() === 6) : false;
+            return !isWeekend ||
+                homeTeamName.includes("masters") ||
+                awayTeamName.includes("masters") ||
+                homeTeamName.includes("midweek") ||
+                awayTeamName.includes("midweek");
+        })
+    };
+};
+
 /**
  * Fetch all clubs
  */
